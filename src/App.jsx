@@ -38,12 +38,18 @@ import {
   Info,
   Download,
   Award,
-  Layers
+  Layers,
+  Lock,
+  Bookmark,
+  FolderOpen
 } from 'lucide-react';
 
 // ==========================================
-// PRESET DATASETS
+// LOCAL STORAGE KEYS & PRESET DATASETS
 // ==========================================
+const STORAGE_KEY_ACTIVE = "odds_analyzer_custom_data";
+const STORAGE_KEY_SAVED_LIST = "odds_analyzer_saved_markets";
+
 const USER_EXAMPLE_JSON = {
   generated_at: "2026-11-08 15:06:23",
   data: {
@@ -175,10 +181,72 @@ function solvePowerK(raw1, raw2) {
 }
 
 /**
+ * Parses a raw 2-way JSON payload (either wrapped in { data: { "1", "2" } } or direct { "1", "2" })
+ * and aligns timestamps across both sides gracefully.
+ */
+function parseAndAlignMarketJson(jsonString) {
+  const parsed = JSON.parse(jsonString);
+  const d1 = parsed?.data?.["1"]?.moves || parsed?.["1"]?.moves;
+  const d2 = parsed?.data?.["2"]?.moves || parsed?.["2"]?.moves;
+
+  if (!Array.isArray(d1) || !Array.isArray(d2) || d1.length === 0 || d2.length === 0) {
+    throw new Error(
+      'JSON must contain "1": { "moves": [...] } and "2": { "moves": [...] } arrays.'
+    );
+  }
+
+  // Build ordered union of timestamps if timestamps match, or align by index/timestamp
+  const map1 = new Map();
+  const map2 = new Map();
+  const allTimestamps = [];
+
+  d1.forEach((m) => {
+    const tStr = String(m.t).trim();
+    map1.set(tStr, parseFloat(m.y));
+    if (!allTimestamps.includes(tStr)) allTimestamps.push(tStr);
+  });
+
+  d2.forEach((m) => {
+    const tStr = String(m.t).trim();
+    map2.set(tStr, parseFloat(m.y));
+    if (!allTimestamps.includes(tStr)) allTimestamps.push(tStr);
+  });
+
+  // Sort chronologically if valid ISO-like timestamps
+  const canSortDates = allTimestamps.every((t) => !isNaN(Date.parse(t.replace(" ", "T"))));
+  if (canSortDates) {
+    allTimestamps.sort(
+      (a, b) => Date.parse(a.replace(" ", "T")) - Date.parse(b.replace(" ", "T"))
+    );
+  }
+
+  let lastO1 = parseFloat(d1[0].y);
+  let lastO2 = parseFloat(d2[0].y);
+
+  const merged = allTimestamps.map((t, idx) => {
+    const o1 = map1.has(t) ? map1.get(t) : parseFloat(d1[idx]?.y ?? lastO1);
+    const o2 = map2.has(t) ? map2.get(t) : parseFloat(d2[idx]?.y ?? lastO2);
+    if (!isNaN(o1)) lastO1 = o1;
+    if (!isNaN(o2)) lastO2 = o2;
+    return { t, o1, o2 };
+  });
+
+  const valid = merged.filter(
+    (r) => !isNaN(r.o1) && !isNaN(r.o2) && r.o1 > 1.0 && r.o2 > 1.0
+  );
+
+  if (valid.length < 2) {
+    throw new Error("Need at least 2 valid odds movement rows with decimal odds > 1.00.");
+  }
+
+  return valid;
+}
+
+/**
  * Computes Vig-Free True Probabilities for a 2-way market
  * @param {number} o1 Decimal odds 1
  * @param {number} o2 Decimal odds 2
- * @param {string} method 'multiplicative' | 'additive' | 'power'
+ * @param {string} method 'multiplicative' | 'additive' | 'power' | 'shin'
  */
 function calculateTrueProbabilities(o1, o2, method = 'multiplicative') {
   const raw1 = 1 / o1;
@@ -196,6 +264,18 @@ function calculateTrueProbabilities(o1, o2, method = 'multiplicative') {
   } else if (method === 'power') {
     const k = solvePowerK(raw1, raw2);
     p1 = Math.pow(raw1, k);
+    p2 = 1 - p1;
+  } else if (method === 'shin') {
+    // Closed-form Shin's method for N = 2 outcomes:
+    // z = (bookSum - 1) / (N - 1) = bookSum - 1 (capped safely below 1)
+    const z = Math.max(0, Math.min(0.95, bookSum - 1));
+    const denom = 2 * (1 - z);
+    const shin1 =
+      (Math.sqrt(z * z + (4 * (1 - z) * (raw1 * raw1)) / bookSum) - z) / denom;
+    const shin2 =
+      (Math.sqrt(z * z + (4 * (1 - z) * (raw2 * raw2)) / bookSum) - z) / denom;
+    const shinSum = shin1 + shin2;
+    p1 = shinSum > 0 ? shin1 / shinSum : raw1 / bookSum;
     p2 = 1 - p1;
   } else {
     // Multiplicative (Proportional) default
@@ -240,17 +320,49 @@ function formatDeltaTime(hours) {
 // MAIN APPLICATION COMPONENT
 // ==========================================
 export default function App() {
-  // Market Data State
-  const [label1, setLabel1] = useState("Outcome 1 (Home)");
-  const [label2, setLabel2] = useState("Outcome 2 (Away)");
+  // Load initial state from localStorage if user previously locked a custom dataset
+  const initialCustomState = useMemo(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_ACTIVE);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (
+          parsed &&
+          Array.isArray(parsed.movesData) &&
+          parsed.movesData.length >= 2
+        ) {
+          return parsed;
+        }
+      }
+    } catch (e) {
+      // Ignore storage read errors
+    }
+    return null;
+  }, []);
+
+  // Decoupled Active Preset ID ('user_steam_flip' | 'pinnacle_sharp_drop' | 'whipsaw_buyback' | 'custom')
+  const [activePresetId, setActivePresetId] = useState(() =>
+    initialCustomState ? "custom" : "user_steam_flip"
+  );
+
+  // Market Labels & Raw JSON Input State (Never auto-overwritten while typing or analyzing)
+  const [label1, setLabel1] = useState(
+    () => initialCustomState?.label1 || "Outcome 1 (Home)"
+  );
+  const [label2, setLabel2] = useState(
+    () => initialCustomState?.label2 || "Outcome 2 (Away)"
+  );
   const [rawJsonText, setRawJsonText] = useState(() =>
-    JSON.stringify(USER_EXAMPLE_JSON, null, 2)
+    initialCustomState?.rawJsonText || JSON.stringify(USER_EXAMPLE_JSON, null, 2)
   );
   const [jsonError, setJsonError] = useState(null);
-  const [activePreset, setActivePreset] = useState("user_steam_flip");
+  const [jsonSuccessMsg, setJsonSuccessMsg] = useState(null);
 
   // Parsed Moves Array [{ t: string, o1: number, o2: number }]
   const [movesData, setMovesData] = useState(() => {
+    if (initialCustomState?.movesData) {
+      return initialCustomState.movesData;
+    }
     const m1 = USER_EXAMPLE_JSON.data["1"].moves;
     const m2 = USER_EXAMPLE_JSON.data["2"].moves;
     return m1.map((item, idx) => ({
@@ -260,8 +372,19 @@ export default function App() {
     }));
   });
 
+  // Saved Custom Markets in localStorage
+  const [savedMarkets, setSavedMarkets] = useState(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_SAVED_LIST);
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+  const [customMarketTitle, setCustomMarketTitle] = useState("");
+
   // Quantitative Configuration State
-  const [vigMethod, setVigMethod] = useState("multiplicative"); // 'multiplicative' | 'additive' | 'power'
+  const [vigMethod, setVigMethod] = useState("multiplicative"); // 'multiplicative' | 'additive' | 'power' | 'shin'
   const [chartMode, setChartMode] = useState("odds"); // 'odds' | 'prob' | 'vig_velocity'
   const [timeScaleMode, setTimeScaleMode] = useState("step"); // 'step' | 'realtime'
   const [showFairLines, setShowFairLines] = useState(true);
@@ -269,7 +392,9 @@ export default function App() {
 
   // CLV & EV Simulator State
   const [simSide, setSimSide] = useState("1"); // '1' | '2'
-  const [simEntryOdds, setSimEntryOdds] = useState(1.89);
+  const [simEntryOdds, setSimEntryOdds] = useState(() =>
+    initialCustomState?.movesData?.[0]?.o1 || 1.89
+  );
   const [simBankroll, setSimBankroll] = useState(1000);
   const [simKellyFraction, setSimKellyFraction] = useState(0.5); // 0.25, 0.5, 1.0
   const [copiedFeatureFormat, setCopiedFeatureFormat] = useState(null);
@@ -279,16 +404,45 @@ export default function App() {
   const [newRowO1, setNewRowO1] = useState("1.78");
   const [newRowO2, setNewRowO2] = useState("2.02");
 
-  // Load Preset Handler
+  // Helper to persist custom dataset to localStorage so it stays locked
+  const persistCustomMarketState = (
+    nextMoves,
+    nextRawJson,
+    nextLabel1,
+    nextLabel2
+  ) => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEY_ACTIVE,
+        JSON.stringify({
+          movesData: nextMoves,
+          rawJsonText: nextRawJson,
+          label1: nextLabel1,
+          label2: nextLabel2,
+          updatedAt: new Date().toISOString()
+        })
+      );
+    } catch (e) {
+      // Ignore storage quota errors
+    }
+  };
+
+  // Explicit Preset Loader — ONLY triggered when user explicitly chooses a preset
   const handleSelectPreset = (presetKey) => {
+    if (presetKey === "custom") {
+      setActivePresetId("custom");
+      return;
+    }
     const preset = PRESETS[presetKey];
     if (!preset) return;
-    setActivePreset(presetKey);
+
+    setActivePresetId(presetKey);
     setLabel1(preset.label1);
     setLabel2(preset.label2);
     const formatted = JSON.stringify(preset.payload, null, 2);
     setRawJsonText(formatted);
     setJsonError(null);
+    setJsonSuccessMsg(null);
 
     const m1 = preset.payload.data["1"].moves;
     const m2 = preset.payload.data["2"].moves;
@@ -301,52 +455,91 @@ export default function App() {
     if (merged.length > 0) {
       setSimEntryOdds(merged[0].o1);
     }
+    try {
+      localStorage.removeItem(STORAGE_KEY_ACTIVE);
+    } catch (e) {}
   };
 
-  // Parse Custom JSON Handler
+  // Parse Custom JSON Handler — Locks activePresetId to "custom" and never overwrites rawJsonText
   const handleApplyJson = () => {
     try {
-      const parsed = JSON.parse(rawJsonText);
-      const d1 = parsed?.data?.["1"]?.moves || parsed?.["1"]?.moves;
-      const d2 = parsed?.data?.["2"]?.moves || parsed?.["2"]?.moves;
+      const valid = parseAndAlignMarketJson(rawJsonText);
 
-      if (!Array.isArray(d1) || !Array.isArray(d2) || d1.length === 0) {
-        throw new Error(
-          'JSON must contain data["1"].moves and data["2"].moves arrays.'
-        );
-      }
-
-      // Align timestamps across both outcomes
-      const map2 = new Map();
-      d2.forEach((m) => map2.set(m.t, parseFloat(m.y)));
-
-      let lastO2 = parseFloat(d2[0].y);
-      const merged = d1.map((m, idx) => {
-        const matchedO2 = map2.has(m.t)
-          ? map2.get(m.t)
-          : parseFloat(d2[idx]?.y ?? lastO2);
-        lastO2 = matchedO2;
-        return {
-          t: String(m.t),
-          o1: parseFloat(m.y),
-          o2: matchedO2
-        };
-      });
-
-      const valid = merged.filter(
-        (r) => !isNaN(r.o1) && !isNaN(r.o2) && r.o1 > 1.0 && r.o2 > 1.0
-      );
-      if (valid.length < 2) {
-        throw new Error("Need at least 2 valid odds movement rows (> 1.00).");
-      }
-
+      // Lock active source to "custom" and update movesData without touching rawJsonText
+      setActivePresetId("custom");
       setMovesData(valid);
-      setSimEntryOdds(valid[0].o1);
+      setSimEntryOdds(simSide === "1" ? valid[0].o1 : valid[0].o2);
       setJsonError(null);
-      setActivePreset("custom");
+      setJsonSuccessMsg(
+        `Locked & analyzed ${valid.length} movements from Custom JSON.`
+      );
+      persistCustomMarketState(valid, rawJsonText, label1, label2);
+    } catch (err) {
+      setJsonSuccessMsg(null);
+      setJsonError(err.message);
+    }
+  };
+
+  // Save current custom JSON analysis to Saved Custom Markets list
+  const handleSaveCustomToLibrary = () => {
+    try {
+      const valid = parseAndAlignMarketJson(rawJsonText);
+      const title =
+        customMarketTitle.trim() ||
+        `${label1} vs ${label2} (${valid[0].o1} → ${valid[valid.length - 1].o1})`;
+      const newEntry = {
+        id: `custom_${Date.now()}`,
+        title,
+        label1,
+        label2,
+        rawJsonText,
+        movesData: valid,
+        savedAt: new Date().toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit"
+        })
+      };
+      const updatedList = [newEntry, ...savedMarkets].slice(0, 20);
+      setSavedMarkets(updatedList);
+      setCustomMarketTitle("");
+      setActivePresetId("custom");
+      setMovesData(valid);
+      persistCustomMarketState(valid, rawJsonText, label1, label2);
+      localStorage.setItem(STORAGE_KEY_SAVED_LIST, JSON.stringify(updatedList));
+      setJsonError(null);
+      setJsonSuccessMsg(`Saved "${title}" to your Custom Markets library.`);
     } catch (err) {
       setJsonError(err.message);
     }
+  };
+
+  const handleLoadSavedMarket = (item) => {
+    setActivePresetId("custom");
+    setLabel1(item.label1);
+    setLabel2(item.label2);
+    setRawJsonText(item.rawJsonText);
+    setMovesData(item.movesData);
+    if (item.movesData.length > 0) {
+      setSimEntryOdds(
+        simSide === "1" ? item.movesData[0].o1 : item.movesData[0].o2
+      );
+    }
+    setJsonError(null);
+    setJsonSuccessMsg(`Loaded saved market: "${item.title}"`);
+    persistCustomMarketState(
+      item.movesData,
+      item.rawJsonText,
+      item.label1,
+      item.label2
+    );
+  };
+
+  const handleDeleteSavedMarket = (id) => {
+    const updated = savedMarkets.filter((m) => m.id !== id);
+    setSavedMarkets(updated);
+    try {
+      localStorage.setItem(STORAGE_KEY_SAVED_LIST, JSON.stringify(updated));
+    } catch (e) {}
   };
 
   // Add manual move step
@@ -354,15 +547,21 @@ export default function App() {
     const o1 = parseFloat(newRowO1);
     const o2 = parseFloat(newRowO2);
     if (isNaN(o1) || isNaN(o2) || o1 <= 1.01 || o2 <= 1.01) return;
-    const updated = [...movesData, { t: newRowT.trim() || `Step ${movesData.length + 1}`, o1, o2 }];
+    const updated = [
+      ...movesData,
+      { t: newRowT.trim() || `Step ${movesData.length + 1}`, o1, o2 }
+    ];
     setMovesData(updated);
-    setActivePreset("custom");
+    setActivePresetId("custom");
+    persistCustomMarketState(updated, rawJsonText, label1, label2);
   };
 
   const handleDeleteMove = (idx) => {
     if (movesData.length <= 2) return;
-    setMovesData(movesData.filter((_, i) => i !== idx));
-    setActivePreset("custom");
+    const updated = movesData.filter((_, i) => i !== idx);
+    setMovesData(updated);
+    setActivePresetId("custom");
+    persistCustomMarketState(updated, rawJsonText, label1, label2);
   };
 
   // ==========================================
@@ -683,19 +882,38 @@ export default function App() {
 
           {/* Preset Selector & JSON Drawer Toggle */}
           <div className="flex flex-wrap items-center gap-2.5">
+            {/* Active Source Lock Status Badge */}
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-mono border ${
+                activePresetId === "custom"
+                  ? "bg-amber-500/15 text-amber-300 border-amber-500/40"
+                  : "bg-slate-900 text-slate-300 border-slate-800"
+              }`}
+            >
+              <Lock
+                className={`w-3.5 h-3.5 ${
+                  activePresetId === "custom" ? "text-amber-400" : "text-slate-500"
+                }`}
+              />
+              <span>
+                {activePresetId === "custom"
+                  ? "Active Source: Custom JSON (Locked)"
+                  : "Active Source: Preset"}
+              </span>
+            </div>
+
             <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-1 text-xs">
               <span className="px-2.5 py-1 text-slate-400 font-medium hidden sm:inline">
-                Dataset:
+                Load Preset:
               </span>
               <select
-                value={activePreset}
-                onChange={(e) => {
-                  if (e.target.value !== "custom") {
-                    handleSelectPreset(e.target.value);
-                  }
-                }}
+                value={activePresetId}
+                onChange={(e) => handleSelectPreset(e.target.value)}
                 className="bg-slate-900 text-slate-200 font-medium px-2.5 py-1.5 rounded border border-slate-700/80 focus:outline-none focus:border-emerald-500 cursor-pointer"
               >
+                <option value="custom">
+                  ★ Custom JSON / Edited Market (Locked)
+                </option>
                 <option value="user_steam_flip">
                   1. Late Sharp Steam & Flip (Your JSON)
                 </option>
@@ -705,9 +923,6 @@ export default function App() {
                 <option value="whipsaw_buyback">
                   3. Two-Way Resistance & Buyback
                 </option>
-                {activePreset === "custom" && (
-                  <option value="custom">Custom / Edited Market</option>
-                )}
               </select>
             </div>
 
@@ -720,7 +935,7 @@ export default function App() {
               }`}
             >
               <Database className="w-3.5 h-3.5" />
-              <span>{showDataEditor ? "Hide JSON / Editor" : "Edit JSON / Moves"}</span>
+              <span>{showDataEditor ? "Hide JSON / Editor" : "Paste / Edit JSON"}</span>
               {showDataEditor ? (
                 <ChevronUp className="w-3.5 h-3.5" />
               ) : (
@@ -744,16 +959,26 @@ export default function App() {
                   Market JSON Payload & Manual Move Editor
                 </h2>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Paste any 2-way market JSON object in your format or add hypothetical line moves below.
+                  Paste any 2-way market JSON object and click <strong>Analyze JSON</strong>. Your custom dataset locks automatically and persists across reloads.
                 </p>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <div className="flex items-center gap-2">
                   <label className="text-xs text-slate-400">Side 1 Label:</label>
                   <input
                     type="text"
                     value={label1}
-                    onChange={(e) => setLabel1(e.target.value)}
+                    onChange={(e) => {
+                      setLabel1(e.target.value);
+                      if (activePresetId === "custom") {
+                        persistCustomMarketState(
+                          movesData,
+                          rawJsonText,
+                          e.target.value,
+                          label2
+                        );
+                      }
+                    }}
                     className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1 text-xs text-white w-36"
                   />
                 </div>
@@ -762,7 +987,17 @@ export default function App() {
                   <input
                     type="text"
                     value={label2}
-                    onChange={(e) => setLabel2(e.target.value)}
+                    onChange={(e) => {
+                      setLabel2(e.target.value);
+                      if (activePresetId === "custom") {
+                        persistCustomMarketState(
+                          movesData,
+                          rawJsonText,
+                          label1,
+                          e.target.value
+                        );
+                      }
+                    }}
                     className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1 text-xs text-white w-36"
                   />
                 </div>
@@ -772,31 +1007,110 @@ export default function App() {
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {/* Left: Raw JSON Input */}
               <div className="space-y-2.5">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <label className="text-xs font-semibold uppercase tracking-wider text-slate-400">
                     Raw JSON Input (`data["1"].moves` & `data["2"].moves`)
                   </label>
-                  <button
-                    onClick={handleApplyJson}
-                    className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 transition"
-                  >
-                    <RefreshCw className="w-3 h-3" />
-                    Parse & Apply JSON
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        setRawJsonText("");
+                        setJsonError(null);
+                        setJsonSuccessMsg(null);
+                      }}
+                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition"
+                    >
+                      Clear Textbox
+                    </button>
+                    <button
+                      onClick={handleApplyJson}
+                      className="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow-md shadow-emerald-950 transition"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Analyze JSON (Lock Dataset)
+                    </button>
+                  </div>
                 </div>
                 <textarea
                   value={rawJsonText}
-                  onChange={(e) => setRawJsonText(e.target.value)}
+                  onChange={(e) => {
+                    setRawJsonText(e.target.value);
+                    if (jsonSuccessMsg) setJsonSuccessMsg(null);
+                  }}
+                  placeholder='Paste {"generated_at":..., "data":{"1":{"moves":[...]}, "2":{"moves":[...]}}} here...'
                   rows={10}
                   spellCheck={false}
                   className="w-full font-mono text-xs bg-slate-950 border border-slate-800 rounded-xl p-3 text-emerald-300 focus:outline-none focus:border-emerald-500/60"
                 />
+
                 {jsonError && (
                   <div className="p-2.5 rounded-lg bg-rose-950/60 border border-rose-700/60 text-rose-300 text-xs flex items-center gap-2">
                     <AlertTriangle className="w-4 h-4 shrink-0" />
                     <span>{jsonError}</span>
                   </div>
                 )}
+
+                {jsonSuccessMsg && (
+                  <div className="p-2.5 rounded-lg bg-emerald-950/60 border border-emerald-700/60 text-emerald-300 text-xs flex items-center gap-2">
+                    <Check className="w-4 h-4 shrink-0" />
+                    <span>{jsonSuccessMsg}</span>
+                  </div>
+                )}
+
+                {/* Save to Custom Markets Library */}
+                <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                      <Bookmark className="w-3.5 h-3.5 text-amber-400" />
+                      Save to Custom Markets Library ({savedMarkets.length} saved)
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      placeholder="Optional label (e.g., Lakers vs Celtics Nov 8)"
+                      value={customMarketTitle}
+                      onChange={(e) => setCustomMarketTitle(e.target.value)}
+                      className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-amber-500"
+                    />
+                    <button
+                      onClick={handleSaveCustomToLibrary}
+                      className="px-3 py-1.5 rounded-lg bg-amber-600/90 hover:bg-amber-500 text-white text-xs font-semibold flex items-center gap-1 shrink-0 transition"
+                    >
+                      <Bookmark className="w-3.5 h-3.5" />
+                      Save Market
+                    </button>
+                  </div>
+
+                  {savedMarkets.length > 0 && (
+                    <div className="max-h-32 overflow-y-auto space-y-1 pt-1">
+                      {savedMarkets.map((item) => (
+                        <div
+                          key={item.id}
+                          className="flex items-center justify-between gap-2 bg-slate-900/90 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs"
+                        >
+                          <button
+                            onClick={() => handleLoadSavedMarket(item)}
+                            className="text-left text-slate-200 hover:text-emerald-300 font-medium truncate flex-1 flex items-center gap-1.5"
+                          >
+                            <FolderOpen className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                            <span className="truncate">{item.title}</span>
+                            <span className="text-[10px] font-mono text-slate-500">
+                              ({item.movesData.length} moves • {item.savedAt})
+                            </span>
+                          </button>
+                          <button
+                            onClick={() => handleDeleteSavedMarket(item.id)}
+                            className="text-slate-500 hover:text-rose-400 p-1"
+                            title="Delete saved market"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Right: Interactive Quick Step Appender */}
@@ -804,7 +1118,7 @@ export default function App() {
                 <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 block">
                   Interactive Step Editor ({movesData.length} Timestamps Loaded)
                 </label>
-                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 max-h-52 overflow-y-auto space-y-1.5">
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 max-h-60 overflow-y-auto space-y-1.5">
                   {movesData.map((m, idx) => (
                     <div
                       key={idx}
@@ -818,6 +1132,13 @@ export default function App() {
                           const next = [...movesData];
                           next[idx] = { ...next[idx], t: e.target.value };
                           setMovesData(next);
+                          setActivePresetId("custom");
+                          persistCustomMarketState(
+                            next,
+                            rawJsonText,
+                            label1,
+                            label2
+                          );
                         }}
                         className="bg-transparent text-slate-300 border-b border-transparent focus:border-emerald-500 focus:outline-none flex-1"
                       />
@@ -833,6 +1154,13 @@ export default function App() {
                               const next = [...movesData];
                               next[idx] = { ...next[idx], o1: val };
                               setMovesData(next);
+                              setActivePresetId("custom");
+                              persistCustomMarketState(
+                                next,
+                                rawJsonText,
+                                label1,
+                                label2
+                              );
                             }
                           }}
                           className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-center text-emerald-300"
@@ -848,6 +1176,13 @@ export default function App() {
                               const next = [...movesData];
                               next[idx] = { ...next[idx], o2: val };
                               setMovesData(next);
+                              setActivePresetId("custom");
+                              persistCustomMarketState(
+                                next,
+                                rawJsonText,
+                                label1,
+                                label2
+                              );
                             }
                           }}
                           className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-center text-amber-300"
@@ -962,11 +1297,12 @@ export default function App() {
                   Vig: {closeStep.overroundPct}%
                 </span>
               </div>
-              <div className="grid grid-cols-3 gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
                 {[
                   { id: "multiplicative", label: "Multiplicative" },
                   { id: "additive", label: "Additive" },
-                  { id: "power", label: "Power (Log)" }
+                  { id: "power", label: "Power (Log)" },
+                  { id: "shin", label: "Shin's Method" }
                 ].map((m) => (
                   <button
                     key={m.id}
